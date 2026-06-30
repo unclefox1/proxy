@@ -3,6 +3,7 @@ const MAX_UPSTREAM_BYTES = 20 * 1024 * 1024;
 
 const ALLOWED_URLS = [
   /^https:\/\/loc\.bus-vision\.jp\/(?:realtime|gtfs|gtfs_v2)\/[A-Za-z0-9_./-]+$/,
+  /^https:\/\/api\.gtfs-data\.jp\/v2\/organizations\/[A-Za-z0-9_.-]+\/feeds\/[A-Za-z0-9_.-]+\/files\/feed\.zip$/,
   /^https:\/\/bus-vision\.jp\/realtime\/[A-Za-z0-9_./-]+$/,
   /^https:\/\/km\.bus-vision\.jp\/realtime\/[A-Za-z0-9_./-]+$/,
   /^https:\/\/realtime\.gtfs\.info\/[A-Za-z0-9_./-]+$/,
@@ -10,7 +11,8 @@ const ALLOWED_URLS = [
   /^http:\/\/kumagaya\.bus-go\.com\/GTFS-RT\/[A-Za-z0-9_./-]+$/,
   /^https:\/\/s3-ajt-mobusta-gtfs\.s3\.ap-northeast-1\.amazonaws\.com\/realtime\/[A-Za-z0-9_./-]+$/,
   /^https:\/\/gtfs-rt-files\.buscatch\.jp\/[A-Za-z0-9_./-]+$/,
-  /^https:\/\/gtfs\.yanbaru-bus-navi\.com\/gtfs-rt\/[A-Za-z0-9_./-]+$/
+  /^https:\/\/gtfs\.yanbaru-bus-navi\.com\/gtfs-rt\/[A-Za-z0-9_./-]+$/,
+  /^https:\/\/api-public\.odpt\.org\/api\/v4\/gtfs\/realtime\/[A-Za-z0-9_./-]+$/
 ];
 
 module.exports = async function handler(req, res) {
