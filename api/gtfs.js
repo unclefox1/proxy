@@ -12,6 +12,7 @@ const ALLOWED_URLS = [
   /^https:\/\/s3-ajt-mobusta-gtfs\.s3\.ap-northeast-1\.amazonaws\.com\/realtime\/[A-Za-z0-9_./-]+$/,
   /^https:\/\/gtfs-rt-files\.buscatch\.jp\/[A-Za-z0-9_./-]+$/,
   /^https:\/\/gtfs\.yanbaru-bus-navi\.com\/gtfs-rt\/[A-Za-z0-9_./-]+$/,
+  /^https:\/\/api-public\.odpt\.org\/api\/v4\/files\/[A-Za-z0-9_./-]+\.zip(?:\?[A-Za-z0-9_./%&=:-]+)?$/,
   /^https:\/\/api-public\.odpt\.org\/api\/v4\/gtfs\/realtime\/[A-Za-z0-9_./-]+$/
 ];
 
