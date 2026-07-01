@@ -28,8 +28,17 @@ module.exports = async function handler(req, res) {
   const prefCodes = getPrefCodes(req.query?.prefCodes);
   try {
     const time = await getCurrentTime();
-    const collections = await Promise.all(prefCodes.map((prefCode) => fetchStationCollection(prefCode, time)));
-    const features = collections.flatMap((collection) => normalizeStationFeatures(collection));
+    const snapshots = await Promise.all(prefCodes.map(async (prefCode) => {
+      const [stationCollection, levelCollection] = await Promise.all([
+        fetchStationCollection(prefCode, time),
+        fetchLevelCollection(prefCode)
+      ]);
+      return { stationCollection, levelCollection };
+    }));
+    const features = snapshots.flatMap(({ stationCollection, levelCollection }) => {
+      const levelIndex = buildLevelIndex(levelCollection);
+      return normalizeStationFeatures(stationCollection, levelIndex);
+    });
     sendJson(res, 200, {
       ok: true,
       fetchedAt: new Date().toISOString(),
@@ -43,7 +52,7 @@ module.exports = async function handler(req, res) {
         features
       }
     }, {
-      "cache-control": "public, s-maxage=86400, stale-while-revalidate=604800"
+      "cache-control": "public, s-maxage=300, stale-while-revalidate=600"
     });
   } catch (error) {
     sendJson(res, 502, {
@@ -86,6 +95,22 @@ async function fetchStationCollection(prefCode, time) {
   throw lastError || new Error(`No station data for ${prefCode}`);
 }
 
+async function fetchLevelCollection(prefCode) {
+  return fetchJson(`${RIVER_BASE}/file/files/obslist/twninfo/tm/stg/${prefCode}.json`);
+}
+
+function buildLevelIndex(collection) {
+  const index = new Map();
+  const towns = Array.isArray(collection?.prefTwn) ? collection.prefTwn : [];
+  towns.forEach((town) => {
+    const levels = Array.isArray(town.stg) ? town.stg : [];
+    levels.forEach((item) => {
+      if (item?.obsFcd) index.set(String(item.obsFcd), item);
+    });
+  });
+  return index;
+}
+
 function buildTimeCandidates(time) {
   const year = Number(time.date.slice(0, 4));
   const month = Number(time.date.slice(4, 6)) - 1;
@@ -102,18 +127,28 @@ function buildTimeCandidates(time) {
   });
 }
 
-function normalizeStationFeatures(collection) {
+function normalizeStationFeatures(collection, levelIndex) {
   const features = Array.isArray(collection?.features) ? collection.features : [];
   return features
     .filter((feature) => feature?.geometry?.type === "Point")
     .map((feature) => {
       const p = feature.properties || {};
+      const obsFcd = String(p.obs_fcd || "");
+      const observation = levelIndex.get(obsFcd) || null;
+      const thresholds = {
+        standby: toNumber(p.rsrv_stg),
+        floodWatch: toNumber(p.warn_stg),
+        evacuation: toNumber(p.spcl_warn_stg),
+        danger: toNumber(p.dng_stg),
+        flood: toNumber(p.fld_stg)
+      };
+      const latest = normalizeObservation(observation, thresholds);
       return {
         type: "Feature",
         geometry: feature.geometry,
         properties: {
-          stationId: String(p.obs_fcd || ""),
-          obsFcd: String(p.obs_fcd || ""),
+          stationId: obsFcd,
+          obsFcd,
           ofcCd: numberOrString(p.ofc_cd),
           itemKindCode: numberOrString(p.itmknd_cd),
           obsCd: numberOrString(p.obs_cd),
@@ -132,11 +167,76 @@ function normalizeStationFeatures(collection) {
           specialWarningStage: toNumber(p.spcl_warn_stg),
           dangerStage: toNumber(p.dng_stg),
           floodStage: toNumber(p.fld_stg),
-          displayStatus: "unknown",
+          latestObservedAt: latest.observedAtJst,
+          latestWaterLevel: latest.waterLevel,
+          latestWaterLevelHeight: latest.waterLevelHeight,
+          latestTenMinuteChange: latest.tenMinuteChange,
+          latestQualityFlag: latest.qualityFlag,
+          latestStatusCode: latest.statusCode,
+          latestOverLevel: latest.overLevel,
+          latestStatusLabel: latest.statusLabel,
+          displayStatus: latest.status,
           source: "国土交通省 川の防災情報"
         }
       };
     });
+}
+
+function normalizeObservation(item, thresholds) {
+  if (!item) {
+    return {
+      observedAtJst: "",
+      waterLevel: null,
+      waterLevelHeight: null,
+      tenMinuteChange: null,
+      qualityFlag: null,
+      statusCode: null,
+      overLevel: null,
+      status: "missing",
+      statusLabel: statusLabels.missing
+    };
+  }
+  const waterLevel = toNumber(item.stg);
+  const statusCode = toNumber(item.stgCcd);
+  const overLevel = toNumber(item.stgOvlvl) ?? 0;
+  const status = classifyStatus({ waterLevel, statusCode, overLevel, thresholds });
+  return {
+    observedAtJst: item.obsTime || "",
+    waterLevel,
+    waterLevelHeight: toNumber(item.stgHght),
+    tenMinuteChange: toNumber(item.stg10mChg),
+    qualityFlag: item.stgQmflg ?? null,
+    statusCode,
+    overLevel,
+    status,
+    statusLabel: statusLabels[status] || "不明"
+  };
+}
+
+function classifyStatus({ waterLevel, statusCode, overLevel, thresholds }) {
+  if (statusCode === null || statusCode >= 130 || waterLevel === null) return "missing";
+  if ((overLevel >= 70 && (validThreshold(thresholds.danger) || validThreshold(thresholds.flood))) || reached(waterLevel, thresholds.danger) || reached(waterLevel, thresholds.flood)) return "danger";
+  if ((overLevel >= 50 && validThreshold(thresholds.evacuation)) || reached(waterLevel, thresholds.evacuation)) return "evacuation";
+  if ((overLevel >= 20 && validThreshold(thresholds.floodWatch)) || reached(waterLevel, thresholds.floodWatch)) return "floodWatch";
+  if (reached(waterLevel, thresholds.standby)) return "standby";
+  return "normal";
+}
+
+const statusLabels = {
+  normal: "通常",
+  standby: "水防団待機水位以上",
+  floodWatch: "氾濫注意水位以上",
+  evacuation: "避難判断水位以上",
+  danger: "氾濫危険水位以上",
+  missing: "欠測・閉局等"
+};
+
+function reached(value, threshold) {
+  return Number.isFinite(value) && validThreshold(threshold) && value >= threshold;
+}
+
+function validThreshold(threshold) {
+  return Number.isFinite(threshold) && threshold > 0;
 }
 
 async function fetchJson(url) {
