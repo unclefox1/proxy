@@ -25,7 +25,9 @@ const ALLOWED_URLS = [
   /^https:\/\/www\.akita-bus\.or\.jp\/~akita-gtfs\/[A-Za-z0-9_./-]+\.zip$/,
   /^https:\/\/www\.takubus\.com\/app\/download\/[0-9]+\/[A-Za-z0-9_./-]+\.zip(?:\?[A-Za-z0-9_./%&=:-]+)?$/,
   /^https:\/\/api-public\.odpt\.org\/api\/v4\/files\/[A-Za-z0-9_./-]+\.zip(?:\?[A-Za-z0-9_./%&=:-]+)?$/,
-  /^https:\/\/api-public\.odpt\.org\/api\/v4\/gtfs\/realtime\/[A-Za-z0-9_./-]+$/
+  /^https:\/\/api-public\.odpt\.org\/api\/v4\/gtfs\/realtime\/[A-Za-z0-9_./-]+$/,
+  /^https:\/\/api\.odpt\.org\/api\/v4\/gtfs\/realtime\/[A-Za-z0-9_./-]+$/,
+  /^https:\/\/api\.odpt\.org\/api\/v4\/files\/[A-Za-z0-9_./-]+\.zip(?:\?[A-Za-z0-9_./%&=:-]+)?$/
 ];
 
 module.exports = async function handler(req, res) {
@@ -56,7 +58,8 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const upstream = await fetch(url, {
+    const upstreamUrl = buildUpstreamUrl(url);
+    const upstream = await fetch(upstreamUrl, {
       method: "GET",
       headers: {
         accept: "application/octet-stream,*/*"
@@ -72,9 +75,25 @@ module.exports = async function handler(req, res) {
     res.setHeader("cache-control", "no-store");
     res.send(buffer);
   } catch (error) {
-    sendJson(res, 502, { error: "Upstream request failed", detail: error.message });
+    sendJson(res, error.status || 502, { error: "Upstream request failed", detail: error.message });
   }
 };
+
+function buildUpstreamUrl(value) {
+  const upstream = new URL(value);
+  if (upstream.hostname !== "api.odpt.org") return upstream.toString();
+
+  const consumerKey = process.env.ODPT_CONSUMER_KEY || "";
+  if (!consumerKey) {
+    const error = new Error("ODPT_CONSUMER_KEY is not configured");
+    error.status = 500;
+    throw error;
+  }
+  if (!upstream.searchParams.has("acl:consumerKey")) {
+    upstream.searchParams.set("acl:consumerKey", consumerKey);
+  }
+  return upstream.toString();
+}
 
 async function getJsonBody(req) {
   if (req.body && typeof req.body === "object") {
