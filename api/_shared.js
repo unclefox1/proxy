@@ -285,7 +285,7 @@ function parseJtwcWarningBulletin(text, sourceUrl, now = new Date()) {
   const year = String(issueDate.getUTCFullYear()).slice(2);
   const stormId = `${basin}${storm[1]}${year}`.toLowerCase();
   const warningNumber = Number(body.match(/WARNING NR\s+(\d+)/i)?.[1] || NaN);
-  const points = parseJtwcWarningPoints(body);
+  const points = parseJtwcWarningPoints(body, issueDate);
   if (!points.length) return null;
 
   return {
@@ -509,6 +509,124 @@ function decodeHtml(text) {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'");
+}
+
+function parseJtwcWarningPoints(text, issueDate) {
+  const body = String(text || "");
+  const points = [];
+  const currentBlock = body.match(/WARNING POSITION:[\s\S]{0,900}?PRESENT WIND DISTRIBUTION:/i)?.[0] || body;
+  const currentTime = currentBlock.match(/(\d{6}Z)\s+---\s+NEAR\s+([0-9.]+)([NS])\s+([0-9.]+)([EW])/i);
+  if (currentTime) {
+    const currentWind = body.match(/PRESENT WIND DISTRIBUTION:[\s\S]{0,200}?MAX SUSTAINED WINDS\s*-\s*(\d{1,3})\s*KT/i);
+    points.push(buildJtwcPoint({
+      forecastHour: 0,
+      rawTime: currentTime[1],
+      lat: signedCoord(currentTime[2], currentTime[3]),
+      lon: signedCoord(currentTime[4], currentTime[5]),
+      windKt: currentWind ? Number(currentWind[1]) : null,
+      issueDate
+    }));
+  }
+  const forecastRe = /(\d{1,3})\s+HRS,\s+VALID AT:\s*[\r\n]+\s*(\d{6}Z)\s+---\s+([0-9.]+)([NS])\s+([0-9.]+)([EW])[\s\S]{0,260}?MAX SUSTAINED WINDS\s*-\s*(\d{1,3})\s*KT/gi;
+  let match;
+  while ((match = forecastRe.exec(body))) {
+    points.push(buildJtwcPoint({
+      forecastHour: Number(match[1]),
+      rawTime: match[2],
+      lat: signedCoord(match[3], match[4]),
+      lon: signedCoord(match[5], match[6]),
+      windKt: Number(match[7]),
+      issueDate
+    }));
+  }
+  return points.filter((point) => Number.isFinite(point.lat) && Number.isFinite(point.lon));
+}
+
+function buildJtwcPoint({ forecastHour, rawTime, lat, lon, windKt, issueDate }) {
+  const targetDate = resolveJtwcDdtg(rawTime, issueDate);
+  const label = `${forecastHour}h`;
+  const targetJst = formatJtwcJst(targetDate);
+  return {
+    forecast_hour: forecastHour,
+    label,
+    valid_time: targetJst || rawTime,
+    valid_time_raw: rawTime,
+    target_time_iso: targetDate ? targetDate.toISOString() : "",
+    target_time_jst: targetJst,
+    time_label: targetJst ? `${label} ${targetJst}` : label,
+    lat,
+    lon,
+    max_wind_kt: windKt
+  };
+}
+
+function resolveJtwcDdtg(ddhhmmZ, issueDate) {
+  const match = String(ddhhmmZ || "").match(/^(\d{2})(\d{2})(\d{2})Z$/i);
+  if (!match || !(issueDate instanceof Date) || Number.isNaN(issueDate.getTime())) return null;
+  const day = Number(match[1]);
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  const candidate = new Date(Date.UTC(issueDate.getUTCFullYear(), issueDate.getUTCMonth(), day, hour, minute));
+  const fifteenDays = 15 * 24 * 60 * 60 * 1000;
+  if (candidate.getTime() - issueDate.getTime() > fifteenDays) candidate.setUTCMonth(candidate.getUTCMonth() - 1);
+  if (issueDate.getTime() - candidate.getTime() > fifteenDays) candidate.setUTCMonth(candidate.getUTCMonth() + 1);
+  return candidate;
+}
+
+function formatJtwcJst(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
+  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${jst.getUTCFullYear()}-${pad(jst.getUTCMonth() + 1)}-${pad(jst.getUTCDate())} ${pad(jst.getUTCHours())}:${pad(jst.getUTCMinutes())} JST`;
+}
+
+function jtwcBulletinToGeoJson(storm) {
+  const features = [];
+  const coords = (storm.points || []).map((point) => [point.lon, point.lat]).filter(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat));
+  if (coords.length >= 2) {
+    const firstPoint = storm.points[0] || {};
+    const lastPoint = storm.points[storm.points.length - 1] || {};
+    features.push({
+      type: "Feature",
+      properties: {
+        stormId: storm.stormId,
+        name: `${storm.title || storm.name} forecast track`,
+        description: `JTWC ${storm.warningNumber ? `Warning NR ${storm.warningNumber}` : "Warning"}`,
+        product: "JTWC NOAA raw warning",
+        feature_type: "track",
+        max_wind_kt: Math.max(...(storm.points || []).map((point) => point.max_wind_kt || 0)),
+        valid_time: firstPoint.target_time_jst || firstPoint.valid_time || "",
+        valid_time_raw: firstPoint.valid_time_raw || "",
+        target_time_iso: firstPoint.target_time_iso || "",
+        target_time_jst: firstPoint.target_time_jst && lastPoint.target_time_jst ? `${firstPoint.target_time_jst} - ${lastPoint.target_time_jst}` : "",
+        time_label: firstPoint.label && lastPoint.label ? `${firstPoint.label}-${lastPoint.label}` : "",
+        color: "#be185d"
+      },
+      geometry: { type: "LineString", coordinates: coords }
+    });
+  }
+  (storm.points || []).forEach((point, index) => {
+    features.push({
+      type: "Feature",
+      properties: {
+        stormId: storm.stormId,
+        name: `${storm.title || storm.name} ${point.label || ""}`.trim(),
+        description: `Max wind ${point.max_wind_kt ?? "-"} kt / ${point.target_time_jst || point.valid_time || ""}`,
+        product: "JTWC NOAA raw warning",
+        feature_type: index === 0 ? "current" : "forecast",
+        forecast_hour: point.forecast_hour,
+        max_wind_kt: point.max_wind_kt,
+        valid_time: point.target_time_jst || point.valid_time || "",
+        valid_time_raw: point.valid_time_raw || "",
+        target_time_iso: point.target_time_iso || "",
+        target_time_jst: point.target_time_jst || "",
+        time_label: point.time_label || point.label || "",
+        color: "#db2777"
+      },
+      geometry: { type: "Point", coordinates: [point.lon, point.lat] }
+    });
+  });
+  return { type: "FeatureCollection", features };
 }
 
 module.exports = {
