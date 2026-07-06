@@ -397,6 +397,28 @@ function jtwcBulletinToGeoJson(storm) {
     });
   }
   (storm.points || []).forEach((point, index) => {
+    const radiusPolygon = createJtwcWindRadiusPolygon(point, "34");
+    if (radiusPolygon) {
+      features.push({
+        type: "Feature",
+        properties: {
+          stormId: storm.stormId,
+          name: `${storm.title || storm.name} ${point.label || ""} 34kt wind radius`.trim(),
+          description: `34 kt wind radius / ${point.target_time_jst || point.valid_time || ""}`,
+          product: "JTWC NOAA raw warning",
+          feature_type: "wind-radius",
+          wind_threshold_kt: 34,
+          forecast_hour: point.forecast_hour,
+          valid_time: point.target_time_jst || point.valid_time || "",
+          valid_time_raw: point.valid_time_raw || "",
+          target_time_iso: point.target_time_iso || "",
+          target_time_jst: point.target_time_jst || "",
+          time_label: point.time_label || point.label || "",
+          color: "#f9a8d4"
+        },
+        geometry: radiusPolygon
+      });
+    }
     features.push({
       type: "Feature",
       properties: {
@@ -414,6 +436,48 @@ function jtwcBulletinToGeoJson(storm) {
     });
   });
   return { type: "FeatureCollection", features };
+}
+
+function createJtwcWindRadiusPolygon(point, threshold = "34") {
+  const radii = point?.wind_radii?.[threshold];
+  if (!radii) return null;
+  const maxRadius = Math.max(radii.ne || 0, radii.se || 0, radii.sw || 0, radii.nw || 0);
+  if (!Number.isFinite(maxRadius) || maxRadius <= 0) return null;
+  const coordinates = [];
+  for (let bearing = 0; bearing <= 360; bearing += 8) {
+    const radiusNm = getJtwcRadiusForBearing(radii, bearing);
+    if (!Number.isFinite(radiusNm) || radiusNm <= 0) continue;
+    coordinates.push(destinationPoint(point.lon, point.lat, bearing, radiusNm * 1.852));
+  }
+  if (coordinates.length < 4) return null;
+  coordinates.push(coordinates[0]);
+  return { type: "Polygon", coordinates: [coordinates] };
+}
+
+function getJtwcRadiusForBearing(radii, bearing) {
+  const normalized = ((bearing % 360) + 360) % 360;
+  if (normalized >= 0 && normalized < 90) return radii.ne;
+  if (normalized >= 90 && normalized < 180) return radii.se;
+  if (normalized >= 180 && normalized < 270) return radii.sw;
+  return radii.nw;
+}
+
+function destinationPoint(lon, lat, bearingDeg, distanceKm) {
+  const radiusKm = 6371.0088;
+  const bearing = bearingDeg * Math.PI / 180;
+  const angularDistance = distanceKm / radiusKm;
+  const lat1 = lat * Math.PI / 180;
+  const lon1 = lon * Math.PI / 180;
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(angularDistance) + Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing));
+  const lon2 = lon1 + Math.atan2(
+    Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+    Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2)
+  );
+  return [normalizeLongitude(lon2 * 180 / Math.PI), lat2 * 180 / Math.PI];
+}
+
+function normalizeLongitude(lon) {
+  return ((lon + 540) % 360) - 180;
 }
 
 function extractKmlFromKmz(buffer) {
@@ -514,38 +578,44 @@ function decodeHtml(text) {
 function parseJtwcWarningPoints(text, issueDate) {
   const body = String(text || "");
   const points = [];
-  const currentBlock = body.match(/WARNING POSITION:[\s\S]{0,900}?PRESENT WIND DISTRIBUTION:/i)?.[0] || body;
+  const currentBlock = body.match(/WARNING POSITION:[\s\S]*?(?=\n\s*---\s*\r?\n\s*FORECASTS:|\n\s*FORECASTS:)/i)?.[0] || body;
   const currentTime = currentBlock.match(/(\d{6}Z)\s+---\s+NEAR\s+([0-9.]+)([NS])\s+([0-9.]+)([EW])/i);
   if (currentTime) {
-    const currentWind = body.match(/PRESENT WIND DISTRIBUTION:[\s\S]{0,200}?MAX SUSTAINED WINDS\s*-\s*(\d{1,3})\s*KT/i);
+    const currentWind = currentBlock.match(/MAX SUSTAINED WINDS\s*-\s*(\d{1,3})\s*KT/i);
     points.push(buildJtwcPoint({
       forecastHour: 0,
       rawTime: currentTime[1],
       lat: signedCoord(currentTime[2], currentTime[3]),
       lon: signedCoord(currentTime[4], currentTime[5]),
       windKt: currentWind ? Number(currentWind[1]) : null,
+      windRadii: parseJtwcWindRadii(currentBlock),
       issueDate
     }));
   }
   const forecastRe = /(\d{1,3})\s+HRS,\s+VALID AT:\s*[\r\n]+\s*(\d{6}Z)\s+---\s+([0-9.]+)([NS])\s+([0-9.]+)([EW])[\s\S]{0,260}?MAX SUSTAINED WINDS\s*-\s*(\d{1,3})\s*KT/gi;
-  let match;
-  while ((match = forecastRe.exec(body))) {
+  const matches = Array.from(body.matchAll(forecastRe));
+  matches.forEach((match, index) => {
+    const nextIndex = matches[index + 1]?.index ?? body.search(/\nREMARKS:/i);
+    const blockEnd = nextIndex > match.index ? nextIndex : Math.min(body.length, match.index + 1600);
+    const block = body.slice(match.index, blockEnd);
     points.push(buildJtwcPoint({
       forecastHour: Number(match[1]),
       rawTime: match[2],
       lat: signedCoord(match[3], match[4]),
       lon: signedCoord(match[5], match[6]),
       windKt: Number(match[7]),
+      windRadii: parseJtwcWindRadii(block),
       issueDate
     }));
-  }
+  });
   return points.filter((point) => Number.isFinite(point.lat) && Number.isFinite(point.lon));
 }
 
-function buildJtwcPoint({ forecastHour, rawTime, lat, lon, windKt, issueDate }) {
+function buildJtwcPoint({ forecastHour, rawTime, lat, lon, windKt, windRadii, issueDate }) {
   const targetDate = resolveJtwcDdtg(rawTime, issueDate);
   const label = `${forecastHour}h`;
   const targetJst = formatJtwcJst(targetDate);
+  const shortTargetJst = formatJtwcJstShort(targetDate);
   return {
     forecast_hour: forecastHour,
     label,
@@ -553,10 +623,11 @@ function buildJtwcPoint({ forecastHour, rawTime, lat, lon, windKt, issueDate }) 
     valid_time_raw: rawTime,
     target_time_iso: targetDate ? targetDate.toISOString() : "",
     target_time_jst: targetJst,
-    time_label: targetJst ? `${label} ${targetJst}` : label,
+    time_label: shortTargetJst ? `${label} ${shortTargetJst}` : label,
     lat,
     lon,
-    max_wind_kt: windKt
+    max_wind_kt: windKt,
+    wind_radii: windRadii || {}
   };
 }
 
@@ -578,6 +649,30 @@ function formatJtwcJst(date) {
   const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
   const pad = (value) => String(value).padStart(2, "0");
   return `${jst.getUTCFullYear()}-${pad(jst.getUTCMonth() + 1)}-${pad(jst.getUTCDate())} ${pad(jst.getUTCHours())}:${pad(jst.getUTCMinutes())} JST`;
+}
+
+function formatJtwcJstShort(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
+  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(jst.getUTCMonth() + 1)}/${pad(jst.getUTCDate())} ${pad(jst.getUTCHours())}:${pad(jst.getUTCMinutes())}`;
+}
+
+function parseJtwcWindRadii(block) {
+  const radii = {};
+  [34, 50, 64].forEach((threshold) => {
+    const pattern = new RegExp(String.raw`RADIUS OF\s+0?${threshold}\s+KT WINDS\s*-\s*(\d{1,3})\s+NM NORTHEAST QUADRANT[\s\S]{0,120}?(\d{1,3})\s+NM SOUTHEAST QUADRANT[\s\S]{0,120}?(\d{1,3})\s+NM SOUTHWEST QUADRANT[\s\S]{0,120}?(\d{1,3})\s+NM NORTHWEST QUADRANT`, "i");
+    const match = String(block || "").match(pattern);
+    if (match) {
+      radii[String(threshold)] = {
+        ne: Number(match[1]),
+        se: Number(match[2]),
+        sw: Number(match[3]),
+        nw: Number(match[4])
+      };
+    }
+  });
+  return radii;
 }
 
 function jtwcBulletinToGeoJson(storm) {
@@ -606,6 +701,28 @@ function jtwcBulletinToGeoJson(storm) {
     });
   }
   (storm.points || []).forEach((point, index) => {
+    const radiusPolygon = createJtwcWindRadiusPolygon(point, "34");
+    if (radiusPolygon) {
+      features.push({
+        type: "Feature",
+        properties: {
+          stormId: storm.stormId,
+          name: `${storm.title || storm.name} ${point.label || ""} 34kt wind radius`.trim(),
+          description: `34 kt wind radius / ${point.target_time_jst || point.valid_time || ""}`,
+          product: "JTWC NOAA raw warning",
+          feature_type: "wind-radius",
+          wind_threshold_kt: 34,
+          forecast_hour: point.forecast_hour,
+          valid_time: point.target_time_jst || point.valid_time || "",
+          valid_time_raw: point.valid_time_raw || "",
+          target_time_iso: point.target_time_iso || "",
+          target_time_jst: point.target_time_jst || "",
+          time_label: point.time_label || point.label || "",
+          color: "#f9a8d4"
+        },
+        geometry: radiusPolygon
+      });
+    }
     features.push({
       type: "Feature",
       properties: {
