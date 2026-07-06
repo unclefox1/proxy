@@ -13,6 +13,13 @@ const TYPE_EXT = {
   webText: "web.txt",
   gif: ".gif"
 };
+const NOAA_RAW_BASE = "https://tgftp.nws.noaa.gov/data/raw/wt/";
+const NOAA_JTWC_BULLETIN_CODES = [
+  ...rangeCodes("wtpn", 31, 35),
+  ...rangeCodes("wtio", 31, 35),
+  ...rangeCodes("wtxs", 31, 35),
+  ...rangeCodes("wtps", 31, 35)
+];
 
 const memoryCache = new Map();
 
@@ -80,6 +87,15 @@ async function fetchOfficialPage() {
 
 async function getStormList(refresh = false) {
   return cached("jtwc:list", 30 * 60 * 1000, async () => {
+    const bulletinStorms = await getJtwcBulletinStorms(true).catch(() => []);
+    if (bulletinStorms.length) {
+      return {
+        ok: true,
+        fetchedAt: new Date().toISOString(),
+        sourceUrl: NOAA_RAW_BASE,
+        storms: bulletinStorms.map(({ warningText, points, ...storm }) => storm)
+      };
+    }
     const { html, sourceUrl } = await fetchOfficialPage();
     const storms = parseJtwcProductLinks(html);
     return {
@@ -173,6 +189,22 @@ async function getProduct(stormId, type, refresh = false) {
 
 async function getGeoJson(stormId, refresh = false) {
   const id = assertStormId(stormId);
+  const bulletinStorms = await getJtwcBulletinStorms(refresh).catch(() => []);
+  const bulletinStorm = bulletinStorms.find((storm) => storm.stormId === id);
+  if (bulletinStorm) {
+    return {
+      ok: true,
+      stormId: id,
+      source: "JTWC / NOAA raw warning",
+      fetchedAt: new Date().toISOString(),
+      geojson: jtwcBulletinToGeoJson(bulletinStorm),
+      warningText: bulletinStorm.warningText,
+      rawProducts: {
+        noaaRaw: bulletinStorm.products?.tcw || bulletinStorm.sourceUrl || "",
+        gif: buildProductUrl(id, "gif")
+      }
+    };
+  }
   const rawProducts = {};
   let kmlText = "";
   let productUrl = "";
@@ -213,6 +245,175 @@ async function getGeoJson(stormId, refresh = false) {
     warningText,
     rawProducts
   };
+}
+
+function rangeCodes(prefix, start, end) {
+  const codes = [];
+  for (let value = start; value <= end; value += 1) codes.push(`${prefix}${value}`);
+  return codes;
+}
+
+async function getJtwcBulletinStorms(refresh = false) {
+  return cached("jtwc:noaa-bulletins", 10 * 60 * 1000, async () => {
+    const now = new Date();
+    const results = await Promise.allSettled(NOAA_JTWC_BULLETIN_CODES.map(async (code) => {
+      const url = `${NOAA_RAW_BASE}${code}.pgtw..txt`;
+      const text = await fetchText(url);
+      return parseJtwcWarningBulletin(text, url, now);
+    }));
+    return results
+      .filter((result) => result.status === "fulfilled" && result.value)
+      .map((result) => result.value)
+      .filter((storm, index, storms) => storms.findIndex((item) => item.stormId === storm.stormId) === index)
+      .sort((a, b) => String(a.issueTime || "").localeCompare(String(b.issueTime || "")) * -1);
+  }, refresh);
+}
+
+function parseJtwcWarningBulletin(text, sourceUrl, now = new Date()) {
+  const body = String(text || "");
+  if (!/JOINT TYPHOON WRNCEN|JOINT TYPHOON WARNING CENTER/i.test(body)) return null;
+  const header = body.match(/^(WT[A-Z]{2}\d{2})\s+PGTW\s+(\d{6})/m);
+  const issueDate = parseJtwcRemarkDate(body, header?.[2]) || inferWmoIssueDate(header?.[2], now);
+  if (!issueDate || now.getTime() - issueDate.getTime() > 10 * 24 * 60 * 60 * 1000) return null;
+  if (/THIS IS THE FINAL WARNING/i.test(body) && now.getTime() - issueDate.getTime() > 12 * 60 * 60 * 1000) return null;
+
+  const subject = body.match(/SUBJ\/([^\r\n]+?WARNING NR\s+\d+)/i)?.[1] || "";
+  const title = body.match(/\b((?:SUPER\s+)?(?:TYPHOON|TROPICAL STORM|TROPICAL DEPRESSION|TROPICAL CYCLONE|CYCLONE)\s+\d{2}[A-Z]\s+\([^)]+\))/i)?.[1] || subject;
+  const storm = title.match(/(\d{2})([A-Z])\s+\(([^)]+)\)/i);
+  if (!storm) return null;
+  const basin = jtwcBasinFromSuffix(storm[2]);
+  const year = String(issueDate.getUTCFullYear()).slice(2);
+  const stormId = `${basin}${storm[1]}${year}`.toLowerCase();
+  const warningNumber = Number(body.match(/WARNING NR\s+(\d+)/i)?.[1] || NaN);
+  const points = parseJtwcWarningPoints(body);
+  if (!points.length) return null;
+
+  return {
+    stormId,
+    basin: basin.toUpperCase(),
+    number: storm[1],
+    year,
+    name: storm[3],
+    title: title.trim(),
+    warningNumber: Number.isFinite(warningNumber) ? warningNumber : null,
+    issueTime: issueDate.toISOString(),
+    sourceUrl,
+    products: { tcw: sourceUrl },
+    points,
+    warningText: body.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]+/g, "").trim()
+  };
+}
+
+function inferWmoIssueDate(ddhhmm, now = new Date()) {
+  const match = String(ddhhmm || "").match(/^(\d{2})(\d{2})(\d{2})$/);
+  if (!match) return null;
+  const day = Number(match[1]);
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  if (!day || hour > 23 || minute > 59) return null;
+  const candidate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), day, hour, minute));
+  if (candidate.getTime() - now.getTime() > 6 * 60 * 60 * 1000) candidate.setUTCMonth(candidate.getUTCMonth() - 1);
+  return candidate;
+}
+
+function parseJtwcRemarkDate(text, ddhhmm) {
+  const dateMatch = String(text || "").match(/\b(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})\b/i);
+  const timeMatch = String(ddhhmm || "").match(/^\d{2}(\d{2})(\d{2})$/);
+  if (!dateMatch) return null;
+  const months = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+  const day = Number(dateMatch[1]);
+  const month = months[dateMatch[2].toUpperCase()];
+  const year = 2000 + Number(dateMatch[3]);
+  const hour = timeMatch ? Number(timeMatch[1]) : 0;
+  const minute = timeMatch ? Number(timeMatch[2]) : 0;
+  if (!day || month === undefined || !Number.isFinite(year) || hour > 23 || minute > 59) return null;
+  return new Date(Date.UTC(year, month, day, hour, minute));
+}
+
+function jtwcBasinFromSuffix(suffix) {
+  const key = String(suffix || "").toUpperCase();
+  if (key === "W") return "wp";
+  if (key === "C") return "cp";
+  if (key === "E") return "ep";
+  if (key === "A" || key === "B") return "io";
+  if (key === "S" || key === "P") return "sh";
+  return "wp";
+}
+
+function parseJtwcWarningPoints(text) {
+  const body = String(text || "");
+  const points = [];
+  const currentBlock = body.match(/WARNING POSITION:[\s\S]{0,900}?PRESENT WIND DISTRIBUTION:/i)?.[0] || body;
+  const currentTime = currentBlock.match(/(\d{6}Z)\s+---\s+NEAR\s+([0-9.]+)([NS])\s+([0-9.]+)([EW])/i);
+  if (currentTime) {
+    const currentWind = body.match(/PRESENT WIND DISTRIBUTION:[\s\S]{0,200}?MAX SUSTAINED WINDS\s*-\s*(\d{1,3})\s*KT/i);
+    points.push({
+      forecast_hour: 0,
+      label: "実況",
+      valid_time: currentTime[1],
+      lat: signedCoord(currentTime[2], currentTime[3]),
+      lon: signedCoord(currentTime[4], currentTime[5]),
+      max_wind_kt: currentWind ? Number(currentWind[1]) : null
+    });
+  }
+  const forecastRe = /(\d{1,3})\s+HRS,\s+VALID AT:\s*[\r\n]+\s*(\d{6}Z)\s+---\s+([0-9.]+)([NS])\s+([0-9.]+)([EW])[\s\S]{0,260}?MAX SUSTAINED WINDS\s*-\s*(\d{1,3})\s*KT/gi;
+  let match;
+  while ((match = forecastRe.exec(body))) {
+    points.push({
+      forecast_hour: Number(match[1]),
+      label: `${Number(match[1])}時間後`,
+      valid_time: match[2],
+      lat: signedCoord(match[3], match[4]),
+      lon: signedCoord(match[5], match[6]),
+      max_wind_kt: Number(match[7])
+    });
+  }
+  return points.filter((point) => Number.isFinite(point.lat) && Number.isFinite(point.lon));
+}
+
+function signedCoord(value, hemisphere) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return NaN;
+  return /S|W/i.test(hemisphere) ? -number : number;
+}
+
+function jtwcBulletinToGeoJson(storm) {
+  const features = [];
+  const coords = (storm.points || []).map((point) => [point.lon, point.lat]).filter(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat));
+  if (coords.length >= 2) {
+    features.push({
+      type: "Feature",
+      properties: {
+        stormId: storm.stormId,
+        name: `${storm.title || storm.name} 予報経路`,
+        description: `JTWC ${storm.warningNumber ? `Warning NR ${storm.warningNumber}` : "Warning"}`,
+        product: "JTWC NOAA raw warning",
+        feature_type: "track",
+        max_wind_kt: Math.max(...(storm.points || []).map((point) => point.max_wind_kt || 0)),
+        valid_time: storm.points?.[0]?.valid_time || "",
+        color: "#be185d"
+      },
+      geometry: { type: "LineString", coordinates: coords }
+    });
+  }
+  (storm.points || []).forEach((point, index) => {
+    features.push({
+      type: "Feature",
+      properties: {
+        stormId: storm.stormId,
+        name: `${storm.title || storm.name} ${point.label || ""}`.trim(),
+        description: `最大風速 ${point.max_wind_kt ?? "-"} kt / ${point.valid_time || ""}`,
+        product: "JTWC NOAA raw warning",
+        feature_type: index === 0 ? "current" : "forecast",
+        forecast_hour: point.forecast_hour,
+        max_wind_kt: point.max_wind_kt,
+        valid_time: point.valid_time,
+        color: "#db2777"
+      },
+      geometry: { type: "Point", coordinates: [point.lon, point.lat] }
+    });
+  });
+  return { type: "FeatureCollection", features };
 }
 
 function extractKmlFromKmz(buffer) {
