@@ -28,9 +28,7 @@ const ALLOWED_REINFOLIB_API_IDS = new Set([
   "XKT030",
   "XKT031",
   "XGT001",
-  "XST001",
-  "XPT001",
-  "XPT002"
+  "XST001"
 ]);
 
 module.exports = async function handler(req, res) {
