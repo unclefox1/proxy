@@ -30,6 +30,10 @@ module.exports = async function handler(req, res) {
   }
 
   const mode = String(req.query.mode || "").toLowerCase();
+  if (mode === "geojson") {
+    await handleGeoJsonTile(req, res);
+    return;
+  }
   if (mode === "pbf" || hasTileQuery(req.query)) {
     await handlePbfTile(req, res);
     return;
@@ -40,9 +44,89 @@ module.exports = async function handler(req, res) {
     ok: true,
     hasApiKey: Boolean(getReinfolibApiKey()),
     allowedApiCount: ALLOWED_REINFOLIB_API_IDS.size,
-    pbfMode: "health?mode=pbf&apiId={apiId}&z={z}&x={x}&y={y}"
+    pbfMode: "health?mode=pbf&apiId={apiId}&z={z}&x={x}&y={y}",
+    geojsonMode: "health?mode=geojson&apiId={apiId}&z={z}&x={x}&y={y}"
   });
 };
+
+async function handleGeoJsonTile(req, res) {
+  const apiId = String(req.query.apiId || "").toUpperCase();
+  const z = parseTileInteger(req.query.z);
+  const x = parseTileInteger(req.query.x);
+  const y = parseTileInteger(req.query.y);
+
+  if (!ALLOWED_REINFOLIB_API_IDS.has(apiId)) {
+    res.status(403).json({ ok: false, error: "Unsupported reinfolib API ID" });
+    return;
+  }
+  if (![z, x, y].every(Number.isInteger) || z < 0 || z > 22 || x < 0 || y < 0) {
+    res.status(400).json({ ok: false, error: "Invalid tile coordinate" });
+    return;
+  }
+
+  const apiKey = getReinfolibApiKey();
+  if (!apiKey) {
+    res.status(500).json({ ok: false, error: "reinfolib API key is not configured" });
+    return;
+  }
+
+  try {
+    const { VectorTile } = require("@mapbox/vector-tile");
+    const Protobuf = require("pbf");
+    const url = new URL(`https://www.reinfolib.mlit.go.jp/ex-api/external/${encodeURIComponent(apiId)}`);
+    url.searchParams.set("response_format", "pbf");
+    url.searchParams.set("z", String(z));
+    url.searchParams.set("x", String(x));
+    url.searchParams.set("y", String(y));
+
+    const upstream = await fetch(url, {
+      headers: {
+        "Ocp-Apim-Subscription-Key": apiKey,
+        "Accept": "application/vnd.mapbox-vector-tile,application/x-protobuf,*/*"
+      }
+    });
+
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => "");
+      res.status(upstream.status).json({
+        ok: false,
+        error: `Reinfolib upstream HTTP ${upstream.status}`,
+        detail: text.slice(0, 300)
+      });
+      return;
+    }
+
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    const tile = new VectorTile(new Protobuf(buffer));
+    const features = [];
+    Object.keys(tile.layers || {}).forEach((layerName) => {
+      const layer = tile.layers[layerName];
+      for (let index = 0; index < layer.length; index += 1) {
+        const feature = layer.feature(index).toGeoJSON(x, y, z);
+        feature.properties = {
+          ...(feature.properties || {}),
+          _reinfolib_source_layer: layerName
+        };
+        features.push(feature);
+      }
+    });
+    const collection = {
+      type: "FeatureCollection",
+      name: `${apiId}/${z}/${x}/${y}`,
+      features
+    };
+
+    res.setHeader("Content-Type", "application/geo+json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, s-maxage=86400, stale-while-revalidate=604800");
+    res.status(200).send(JSON.stringify(collection));
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: "Failed to fetch or decode reinfolib GeoJSON tile",
+      detail: error.message || String(error)
+    });
+  }
+}
 
 async function handlePbfTile(req, res) {
   const apiId = String(req.query.apiId || "").toUpperCase();
