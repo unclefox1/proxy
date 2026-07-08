@@ -2,19 +2,35 @@ const ALLOWED_REINFOLIB_API_IDS = new Set([
   "XKT001",
   "XKT002",
   "XKT003",
+  "XKT004",
+  "XKT005",
   "XKT006",
+  "XKT007",
   "XKT010",
   "XKT011",
   "XKT013",
   "XKT014",
+  "XKT015",
   "XKT016",
   "XKT017",
   "XKT018",
+  "XKT019",
   "XKT020",
+  "XKT021",
+  "XKT022",
   "XKT023",
+  "XKT024",
   "XKT025",
+  "XKT026",
+  "XKT027",
+  "XKT028",
+  "XKT029",
   "XKT030",
-  "XKT031"
+  "XKT031",
+  "XGT001",
+  "XST001",
+  "XPT001",
+  "XPT002"
 ]);
 
 module.exports = async function handler(req, res) {
@@ -76,6 +92,7 @@ async function handleGeoJsonTile(req, res) {
     url.searchParams.set("z", String(z));
     url.searchParams.set("x", String(x));
     url.searchParams.set("y", String(y));
+    appendReinfolibExtraParams(url, req.query);
 
     const upstream = await fetch(url, {
       headers: {
@@ -393,6 +410,7 @@ async function handlePbfTile(req, res) {
   url.searchParams.set("z", String(z));
   url.searchParams.set("x", String(x));
   url.searchParams.set("y", String(y));
+  appendReinfolibExtraParams(url, req.query);
 
   try {
     const upstream = await fetch(url, {
@@ -436,6 +454,17 @@ function parseTileInteger(value) {
 
 function getReinfolibApiKey() {
   return process.env.reinfolib || process.env.REINFOLIB || process.env.REINFOLIB_API_KEY || process.env.DefaultApplication || process.env.DEFAULT_APPLICATION || "";
+}
+
+function appendReinfolibExtraParams(url, query) {
+  const reserved = new Set(["mode", "apiId", "z", "x", "y"]);
+  Object.entries(query || {}).forEach(([key, value]) => {
+    if (reserved.has(key) || value === undefined || value === null || value === "") return;
+    const values = Array.isArray(value) ? value : [value];
+    values.forEach((item) => {
+      if (item !== undefined && item !== null && item !== "") url.searchParams.append(key, String(item));
+    });
+  });
 }
 
 function setCors(res) {
