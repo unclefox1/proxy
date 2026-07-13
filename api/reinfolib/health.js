@@ -31,11 +31,20 @@ const ALLOWED_REINFOLIB_API_IDS = new Set([
   "XST001"
 ]);
 
+const DPF_API_URL = "https://data-platform.mlit.go.jp/api/v1/";
+const DPF_MAX_SIZE = 200;
+const DPF_TIMEOUT_MS = 20000;
+
 module.exports = async function handler(req, res) {
   setCors(res);
 
   if (req.method === "OPTIONS") {
     res.status(204).end();
+    return;
+  }
+  const service = String(req.query?.service || req.body?.service || "").toLowerCase();
+  if (service === "dpf") {
+    await handleDpf(req, res);
     return;
   }
   if (req.method !== "GET") {
@@ -62,6 +71,135 @@ module.exports = async function handler(req, res) {
     geojsonMode: "health?mode=geojson&apiId={apiId}&z={z}&x={x}&y={y}"
   });
 };
+
+async function handleDpf(req, res) {
+  const apiKey = process.env.app_1 || process.env.MLIT_DPF_API_KEY || "";
+  if (req.method === "GET") {
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).json({ ok: true, service: "mlit-dpf", apiConfigured: Boolean(apiKey), endpoint: DPF_API_URL });
+    return;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({ ok: false, error: "POST only" });
+    return;
+  }
+  if (!apiKey) {
+    res.status(503).json({ ok: false, error: "国土交通DPF APIの接続設定がありません。" });
+    return;
+  }
+  try {
+    const input = normalizeDpfSearchInput(req.body || {});
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DPF_TIMEOUT_MS);
+    let upstream;
+    try {
+      upstream = await fetch(DPF_API_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          apikey: apiKey,
+          "user-agent": "Tondabayashi-Cultural-Heritage-Hazard-Map/1.0"
+        },
+        body: JSON.stringify({ query: buildDpfSearchQuery(input) }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    const raw = await upstream.text();
+    let payload;
+    try { payload = JSON.parse(raw); } catch (_error) {
+      throw new Error(`国土交通DPFからJSON以外の応答を受信しました（HTTP ${upstream.status}）。`);
+    }
+    if (!upstream.ok) throw new Error(`国土交通DPF HTTP ${upstream.status}`);
+    if (Array.isArray(payload.errors) && payload.errors.length) {
+      throw new Error(payload.errors.map((item) => item?.message).filter(Boolean).join(" / ") || "国土交通DPF検索に失敗しました。");
+    }
+    const search = payload?.data?.search || {};
+    const results = Array.isArray(search.searchResults) ? search.searchResults.map(normalizeDpfResult) : [];
+    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=300");
+    res.status(200).json({
+      ok: true,
+      totalNumber: Number(search.totalNumber) || results.length,
+      results,
+      fetchedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    const aborted = error?.name === "AbortError";
+    res.status(aborted ? 504 : 502).json({
+      ok: false,
+      error: aborted ? "国土交通DPFの応答がタイムアウトしました。" : sanitizeDpfError(error)
+    });
+  }
+}
+
+function normalizeDpfSearchInput(body) {
+  const term = String(body.term || "").trim().slice(0, 80);
+  const scope = ["tondabayashi", "osaka", "viewport", "nationwide"].includes(body.scope) ? body.scope : "tondabayashi";
+  const size = Math.max(1, Math.min(DPF_MAX_SIZE, Math.floor(Number(body.size) || 100)));
+  const input = { term, scope, size, bbox: null };
+  if (scope === "viewport") {
+    const values = Array.isArray(body.bbox) ? body.bbox.map(Number) : [];
+    if (values.length !== 4 || !values.every(Number.isFinite)) throw new Error("表示範囲が正しくありません。");
+    const [west, south, east, north] = values;
+    if (west < -180 || east > 180 || south < -90 || north > 90 || west >= east || south >= north) throw new Error("表示範囲が正しくありません。");
+    input.bbox = values;
+  }
+  if ((scope === "viewport" || scope === "nationwide") && !term) throw new Error("表示範囲・全国検索ではキーワードを入力してください。");
+  return input;
+}
+
+function buildDpfSearchQuery(input) {
+  const filters = ["first: 0"];
+  if (input.term || input.scope === "tondabayashi" || input.scope === "osaka") filters.push(`term: ${JSON.stringify(input.term)}`);
+  filters.push("phraseMatch: true");
+  if (input.scope === "tondabayashi") filters.push('attributeFilter: { attributeName: "DPF:municipality_code", is: 272141 }');
+  else if (input.scope === "osaka") filters.push('attributeFilter: { attributeName: "DPF:prefecture_code", is: 27 }');
+  else if (input.scope === "viewport" && input.bbox) {
+    const [west, south, east, north] = input.bbox;
+    filters.push(`locationFilter: { rectangle: { topLeft: { lat: ${north}, lon: ${west} }, bottomRight: { lat: ${south}, lon: ${east} } } }`);
+  }
+  filters.push(`size: ${input.size}`);
+  return `query HazardMapDpfSearch { search(${filters.join(", ")}) { totalNumber searchResults { id title lat lon year theme metadata dataset_id catalog_id hasThumbnail } } }`;
+}
+
+function normalizeDpfResult(item) {
+  return {
+    id: dpfScalar(item?.id),
+    title: dpfScalar(item?.title),
+    lat: dpfFiniteNumber(item?.lat),
+    lon: dpfFiniteNumber(item?.lon),
+    year: dpfScalar(item?.year),
+    theme: normalizeDpfValue(item?.theme),
+    metadata: normalizeDpfValue(item?.metadata),
+    datasetId: dpfScalar(item?.dataset_id),
+    catalogId: dpfScalar(item?.catalog_id),
+    hasThumbnail: Boolean(item?.hasThumbnail)
+  };
+}
+
+function normalizeDpfValue(value) {
+  if (value === null || value === undefined) return null;
+  if (["string", "number", "boolean"].includes(typeof value)) return value;
+  if (Array.isArray(value)) return value.slice(0, 50).map(normalizeDpfValue);
+  if (typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 100).map(([key, item]) => [String(key).slice(0, 100), normalizeDpfValue(item)]));
+  return String(value);
+}
+
+function dpfScalar(value) {
+  if (value === null || value === undefined) return "";
+  return typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+
+function dpfFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sanitizeDpfError(error) {
+  return String(error?.message || error || "国土交通DPF検索に失敗しました。").replace(/[\u0000-\u001f]+/g, " ").slice(0, 500);
+}
 
 async function handleGeoJsonTile(req, res) {
   const apiId = String(req.query.apiId || "").toUpperCase();
@@ -467,6 +605,8 @@ function appendReinfolibExtraParams(url, query) {
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
+
+module.exports._test = Object.freeze({ normalizeDpfSearchInput, buildDpfSearchQuery, normalizeDpfResult });
