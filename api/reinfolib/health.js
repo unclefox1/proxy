@@ -34,6 +34,12 @@ const ALLOWED_REINFOLIB_API_IDS = new Set([
 const DPF_API_URL = "https://data-platform.mlit.go.jp/api/v1/";
 const DPF_MAX_SIZE = 10000;
 const DPF_TIMEOUT_MS = 60000;
+const DPF_GEOMETRY_MAX_RECORDS = 500;
+const DPF_GEOMETRY_MAX_HTML_BYTES = 2 * 1024 * 1024;
+const DPF_GEOMETRY_MAX_ZIP_BYTES = 40 * 1024 * 1024;
+const DPF_GEOMETRY_MAX_UNCOMPRESSED_BYTES = 120 * 1024 * 1024;
+const DPF_GEOMETRY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+const DPF_GEOMETRY_CACHE = new Map();
 
 module.exports = async function handler(req, res) {
   setCors(res);
@@ -76,11 +82,15 @@ async function handleDpf(req, res) {
   const apiKey = process.env.app_1 || process.env.MLIT_DPF_API_KEY || "";
   if (req.method === "GET") {
     res.setHeader("Cache-Control", "no-store");
-    res.status(200).json({ ok: true, service: "mlit-dpf", apiConfigured: Boolean(apiKey), endpoint: DPF_API_URL });
+    res.status(200).json({ ok: true, service: "mlit-dpf", apiConfigured: Boolean(apiKey), datasetFilter: true, maxSize: DPF_MAX_SIZE, endpoint: DPF_API_URL });
     return;
   }
   if (req.method !== "POST") {
     res.status(405).json({ ok: false, error: "POST only" });
+    return;
+  }
+  if (req.body?.action === "resolve-geometry") {
+    await handleDpfGeometryResolution(req, res);
     return;
   }
   if (!apiKey) {
@@ -118,9 +128,10 @@ async function handleDpf(req, res) {
     }
     const search = payload?.data?.search || {};
     const results = Array.isArray(search.searchResults) ? search.searchResults.map(normalizeDpfResult) : [];
-    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=300");
+    res.setHeader("Cache-Control", "no-store");
     res.status(200).json({
       ok: true,
+      requestedDatasetId: input.datasetId,
       totalNumber: Number(search.totalNumber) || results.length,
       returnedNumber: results.length,
       limit: input.size,
@@ -134,6 +145,257 @@ async function handleDpf(req, res) {
       error: aborted ? "国土交通DPFの応答がタイムアウトしました。" : sanitizeDpfError(error)
     });
   }
+}
+
+async function handleDpfGeometryResolution(req, res) {
+  try {
+    const sourceUrl = validateDpfGeometrySourceUrl(req.body?.sourceUrl);
+    const records = normalizeDpfGeometryRecords(req.body?.records);
+    const source = await loadDpfGeometrySource(sourceUrl);
+    const geometries = matchDpfGeometryRecords(records, source.features);
+    const payload = {
+      ok: true,
+      sourceUrl,
+      zipUrl: source.zipUrl,
+      geometries,
+      fetchedAt: new Date().toISOString()
+    };
+    const json = JSON.stringify(payload);
+    if (Buffer.byteLength(json, "utf8") > DPF_GEOMETRY_MAX_RESPONSE_BYTES) {
+      throw new DpfGeometryInputError("Resolved geometry response is too large");
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    if (typeof res.send === "function") res.status(200).send(json);
+    else res.status(200).json(payload);
+  } catch (error) {
+    const status = error instanceof DpfGeometryInputError ? 400 : 502;
+    res.status(status).json({ ok: false, error: sanitizeDpfError(error) });
+  }
+}
+
+class DpfGeometryInputError extends Error {}
+
+function validateDpfGeometrySourceUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || ""));
+  } catch (_error) {
+    throw new DpfGeometryInputError("Invalid official data page URL");
+  }
+  if (
+    url.protocol !== "https:"
+    || url.hostname !== "nlftp.mlit.go.jp"
+    || url.username
+    || url.password
+    || !/^\/ksj\/gml\/datalist\/KsjTmplt-[A-Za-z0-9_-]+\.html$/.test(url.pathname)
+  ) {
+    throw new DpfGeometryInputError("Unsupported official data page URL");
+  }
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+function normalizeDpfGeometryRecords(value) {
+  if (!Array.isArray(value) || !value.length) throw new DpfGeometryInputError("Geometry records are required");
+  if (value.length > DPF_GEOMETRY_MAX_RECORDS) throw new DpfGeometryInputError("Too many geometry records");
+  return value.map((item) => {
+    const index = Number(item?.index);
+    const lon = Number(item?.lon);
+    const lat = Number(item?.lat);
+    const title = String(item?.title || "").trim().slice(0, 200);
+    if (!Number.isInteger(index) || index < 0 || !Number.isFinite(lon) || !Number.isFinite(lat) || !title) {
+      throw new DpfGeometryInputError("Invalid geometry record");
+    }
+    if (lon < -180 || lon > 180 || lat < -90 || lat > 90) throw new DpfGeometryInputError("Invalid geometry coordinate");
+    return { index, title, lon, lat };
+  });
+}
+
+async function loadDpfGeometrySource(sourceUrl) {
+  const cached = DPF_GEOMETRY_CACHE.get(sourceUrl);
+  if (cached) return cached;
+  const html = await fetchDpfBuffer(sourceUrl, DPF_GEOMETRY_MAX_HTML_BYTES, "text/html");
+  const zipUrl = extractNlniZipUrl(html.toString("utf8"), sourceUrl);
+  const zip = await fetchDpfBuffer(zipUrl, DPF_GEOMETRY_MAX_ZIP_BYTES, "application/zip");
+  const files = extractGeoJsonFilesFromZip(zip);
+  const features = [];
+  files.forEach(({ name, text }) => {
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (_error) {
+      return;
+    }
+    if (data?.type !== "FeatureCollection" || !Array.isArray(data.features)) return;
+    data.features.forEach((feature) => {
+      if (!isDpfSourceGeometry(feature?.geometry)) return;
+      features.push({
+        type: "Feature",
+        properties: feature.properties && typeof feature.properties === "object" ? feature.properties : {},
+        geometry: feature.geometry,
+        _sourceFile: name
+      });
+    });
+  });
+  if (!features.length) throw new Error("Official ZIP contains no usable GeoJSON features");
+  const source = { sourceUrl, zipUrl, features };
+  DPF_GEOMETRY_CACHE.set(sourceUrl, source);
+  while (DPF_GEOMETRY_CACHE.size > 2) DPF_GEOMETRY_CACHE.delete(DPF_GEOMETRY_CACHE.keys().next().value);
+  return source;
+}
+
+async function fetchDpfBuffer(url, maxBytes, accept) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DPF_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      headers: { accept, "user-agent": "Tondabayashi-Cultural-Heritage-Hazard-Map/1.0" },
+      redirect: "error",
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`Official data HTTP ${response.status}`);
+    const length = Number(response.headers.get("content-length"));
+    if (Number.isFinite(length) && length > maxBytes) throw new Error("Official data is too large");
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > maxBytes) throw new Error("Official data is too large");
+    return buffer;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractNlniZipUrl(html, sourceUrl) {
+  const paths = Array.from(String(html || "").matchAll(/["'](\.\.\/data\/[A-Za-z0-9_./-]+\.zip)["']/gi), (match) => match[1]);
+  if (!paths.length) throw new Error("Official ZIP URL was not found");
+  const zipUrl = new URL(paths[0], sourceUrl);
+  if (
+    zipUrl.protocol !== "https:"
+    || zipUrl.hostname !== "nlftp.mlit.go.jp"
+    || !zipUrl.pathname.startsWith("/ksj/gml/data/")
+    || !zipUrl.pathname.toLowerCase().endsWith(".zip")
+  ) {
+    throw new Error("Official ZIP URL is not allowed");
+  }
+  return zipUrl.href;
+}
+
+function extractGeoJsonFilesFromZip(buffer) {
+  const { inflateRawSync } = require("node:zlib");
+  const entries = readZipEntries(buffer).filter((entry) => /\/UTF-8\/[^/]+\.geojson$/i.test(entry.name));
+  const files = [];
+  let totalBytes = 0;
+  for (const entry of entries.slice(0, 8)) {
+    totalBytes += entry.uncompressedSize;
+    if (totalBytes > DPF_GEOMETRY_MAX_UNCOMPRESSED_BYTES) throw new Error("Official ZIP expands beyond the safety limit");
+    const localOffset = entry.localHeaderOffset;
+    if (buffer.readUInt32LE(localOffset) !== 0x04034b50) throw new Error("Invalid ZIP local header");
+    const nameLength = buffer.readUInt16LE(localOffset + 26);
+    const extraLength = buffer.readUInt16LE(localOffset + 28);
+    const dataOffset = localOffset + 30 + nameLength + extraLength;
+    const compressed = buffer.subarray(dataOffset, dataOffset + entry.compressedSize);
+    let output;
+    if (entry.method === 0) output = Buffer.from(compressed);
+    else if (entry.method === 8) output = inflateRawSync(compressed, { maxOutputLength: DPF_GEOMETRY_MAX_UNCOMPRESSED_BYTES });
+    else continue;
+    if (output.length !== entry.uncompressedSize) throw new Error("ZIP entry size mismatch");
+    files.push({ name: entry.name, text: output.toString("utf8") });
+  }
+  if (!files.length) throw new Error("Official ZIP contains no UTF-8 GeoJSON files");
+  return files;
+}
+
+function readZipEntries(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 22) throw new Error("Invalid ZIP file");
+  const minimum = Math.max(0, buffer.length - 22 - 0xffff);
+  let eocd = -1;
+  for (let offset = buffer.length - 22; offset >= minimum; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) { eocd = offset; break; }
+  }
+  if (eocd < 0) throw new Error("ZIP directory was not found");
+  const totalEntries = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (offset + 46 > buffer.length || buffer.readUInt32LE(offset) !== 0x02014b50) throw new Error("Invalid ZIP directory entry");
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const uncompressedSize = buffer.readUInt32LE(offset + 24);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localHeaderOffset = buffer.readUInt32LE(offset + 42);
+    const end = offset + 46 + nameLength + extraLength + commentLength;
+    if (end > buffer.length) throw new Error("Invalid ZIP directory bounds");
+    const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString("utf8").replace(/\\/g, "/");
+    entries.push({ name, method, compressedSize, uncompressedSize, localHeaderOffset });
+    offset = end;
+  }
+  return entries;
+}
+
+function matchDpfGeometryRecords(records, features) {
+  const byTitle = new Map();
+  features.forEach((feature) => {
+    const values = Object.values(feature.properties || {}).filter((value) => ["string", "number"].includes(typeof value));
+    values.forEach((value) => {
+      const key = normalizeDpfMatchText(value);
+      if (!key) return;
+      if (!byTitle.has(key)) byTitle.set(key, []);
+      byTitle.get(key).push(feature);
+    });
+  });
+  return records.flatMap((record) => {
+    const candidates = byTitle.get(normalizeDpfMatchText(record.title)) || [];
+    let best = null;
+    let bestDistance = Infinity;
+    candidates.forEach((feature) => {
+      const distance = dpfPointGeometryDistanceSquared(record.lon, record.lat, feature.geometry);
+      if (distance < bestDistance) { best = feature; bestDistance = distance; }
+    });
+    return best ? [{ index: record.index, geometry: best.geometry }] : [];
+  });
+}
+
+function normalizeDpfMatchText(value) {
+  return String(value ?? "").normalize("NFKC").replace(/[\s\u3000]+/g, "").toLowerCase();
+}
+
+function dpfPointGeometryDistanceSquared(lon, lat, geometry) {
+  let best = Infinity;
+  const visitLine = (coordinates) => {
+    for (let index = 1; index < coordinates.length; index += 1) {
+      best = Math.min(best, dpfPointSegmentDistanceSquared(lon, lat, coordinates[index - 1], coordinates[index]));
+    }
+    if (coordinates.length === 1) best = Math.min(best, dpfCoordinateDistanceSquared(lon, lat, coordinates[0]));
+  };
+  if (geometry?.type === "Point") return dpfCoordinateDistanceSquared(lon, lat, geometry.coordinates);
+  if (geometry?.type === "MultiPoint" || geometry?.type === "LineString") visitLine(geometry.coordinates || []);
+  else if (geometry?.type === "MultiLineString" || geometry?.type === "Polygon") (geometry.coordinates || []).forEach(visitLine);
+  else if (geometry?.type === "MultiPolygon") (geometry.coordinates || []).forEach((polygon) => polygon.forEach(visitLine));
+  return best;
+}
+
+function dpfPointSegmentDistanceSquared(x, y, start, end) {
+  if (!Array.isArray(start) || !Array.isArray(end)) return Infinity;
+  const dx = Number(end[0]) - Number(start[0]);
+  const dy = Number(end[1]) - Number(start[1]);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return Infinity;
+  if (dx === 0 && dy === 0) return dpfCoordinateDistanceSquared(x, y, start);
+  const t = Math.max(0, Math.min(1, ((x - start[0]) * dx + (y - start[1]) * dy) / (dx * dx + dy * dy)));
+  const px = Number(start[0]) + t * dx;
+  const py = Number(start[1]) + t * dy;
+  return (x - px) ** 2 + (y - py) ** 2;
+}
+
+function dpfCoordinateDistanceSquared(x, y, coordinate) {
+  if (!Array.isArray(coordinate) || !Number.isFinite(Number(coordinate[0])) || !Number.isFinite(Number(coordinate[1]))) return Infinity;
+  return (x - Number(coordinate[0])) ** 2 + (y - Number(coordinate[1])) ** 2;
+}
+
+function isDpfSourceGeometry(geometry) {
+  return Boolean(geometry && ["Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"].includes(geometry.type));
 }
 
 function normalizeDpfSearchInput(body) {
@@ -614,4 +876,14 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-module.exports._test = Object.freeze({ normalizeDpfSearchInput, buildDpfSearchQuery, normalizeDpfResult });
+module.exports._test = Object.freeze({
+  normalizeDpfSearchInput,
+  buildDpfSearchQuery,
+  normalizeDpfResult,
+  validateDpfGeometrySourceUrl,
+  normalizeDpfGeometryRecords,
+  extractNlniZipUrl,
+  extractGeoJsonFilesFromZip,
+  readZipEntries,
+  matchDpfGeometryRecords
+});
