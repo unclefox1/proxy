@@ -32,8 +32,8 @@ const ALLOWED_REINFOLIB_API_IDS = new Set([
 ]);
 
 const DPF_API_URL = "https://data-platform.mlit.go.jp/api/v1/";
-const DPF_MAX_SIZE = 200;
-const DPF_TIMEOUT_MS = 20000;
+const DPF_MAX_SIZE = 10000;
+const DPF_TIMEOUT_MS = 60000;
 
 module.exports = async function handler(req, res) {
   setCors(res);
@@ -122,6 +122,8 @@ async function handleDpf(req, res) {
     res.status(200).json({
       ok: true,
       totalNumber: Number(search.totalNumber) || results.length,
+      returnedNumber: results.length,
+      limit: input.size,
       results,
       fetchedAt: new Date().toISOString()
     });
@@ -136,9 +138,11 @@ async function handleDpf(req, res) {
 
 function normalizeDpfSearchInput(body) {
   const term = String(body.term || "").trim().slice(0, 80);
+  const datasetId = String(body.datasetId || "").trim().slice(0, 120);
   const scope = ["tondabayashi", "osaka", "viewport", "nationwide"].includes(body.scope) ? body.scope : "tondabayashi";
-  const size = Math.max(1, Math.min(DPF_MAX_SIZE, Math.floor(Number(body.size) || 100)));
-  const input = { term, scope, size, bbox: null };
+  const size = body.size === "all" ? DPF_MAX_SIZE : Math.max(1, Math.min(DPF_MAX_SIZE, Math.floor(Number(body.size) || 100)));
+  if (!/^[A-Za-z0-9_.-]{1,120}$/.test(datasetId)) throw new Error("検索するデータセットが正しくありません。");
+  const input = { term, datasetId, scope, size, bbox: null };
   if (scope === "viewport") {
     const values = Array.isArray(body.bbox) ? body.bbox.map(Number) : [];
     if (values.length !== 4 || !values.every(Number.isFinite)) throw new Error("表示範囲が正しくありません。");
@@ -146,17 +150,18 @@ function normalizeDpfSearchInput(body) {
     if (west < -180 || east > 180 || south < -90 || north > 90 || west >= east || south >= north) throw new Error("表示範囲が正しくありません。");
     input.bbox = values;
   }
-  if ((scope === "viewport" || scope === "nationwide") && !term) throw new Error("表示範囲・全国検索ではキーワードを入力してください。");
   return input;
 }
 
 function buildDpfSearchQuery(input) {
   const filters = ["first: 0"];
-  if (input.term || input.scope === "tondabayashi" || input.scope === "osaka") filters.push(`term: ${JSON.stringify(input.term)}`);
+  if (input.term) filters.push(`term: ${JSON.stringify(input.term)}`);
   filters.push("phraseMatch: true");
-  if (input.scope === "tondabayashi") filters.push('attributeFilter: { attributeName: "DPF:municipality_code", is: 272141 }');
-  else if (input.scope === "osaka") filters.push('attributeFilter: { attributeName: "DPF:prefecture_code", is: 27 }');
-  else if (input.scope === "viewport" && input.bbox) {
+  const attributeFilters = [`{ attributeName: "DPF:dataset_id", is: ${JSON.stringify(input.datasetId)} }`];
+  if (input.scope === "tondabayashi") attributeFilters.push('{ attributeName: "DPF:municipality_code", is: 272141 }');
+  else if (input.scope === "osaka") attributeFilters.push('{ attributeName: "DPF:prefecture_code", is: 27 }');
+  filters.push(`attributeFilter: ${attributeFilters.length === 1 ? attributeFilters[0] : `{ AND: [${attributeFilters.join(", ")}] }`}`);
+  if (input.scope === "viewport" && input.bbox) {
     const [west, south, east, north] = input.bbox;
     filters.push(`locationFilter: { rectangle: { topLeft: { lat: ${north}, lon: ${west} }, bottomRight: { lat: ${south}, lon: ${east} } } }`);
   }
