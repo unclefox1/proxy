@@ -254,9 +254,9 @@ async function fetchJson(url) {
 
 function setCorsHeaders(req, res, methods) {
   const origin = req.headers.origin || "";
+  res.setHeader("vary", "Origin");
   if (origin === "https://adeac.jp" || origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1")) {
     res.setHeader("access-control-allow-origin", origin);
-    res.setHeader("vary", "Origin");
   }
   res.setHeader("access-control-allow-methods", methods);
   res.setHeader("access-control-allow-headers", "content-type");
