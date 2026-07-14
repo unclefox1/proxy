@@ -354,8 +354,25 @@ function matchDpfGeometryRecords(records, features) {
       const distance = dpfPointGeometryDistanceSquared(record.lon, record.lat, feature.geometry);
       if (distance < bestDistance) { best = feature; bestDistance = distance; }
     });
-    return best ? [{ index: record.index, geometry: best.geometry }] : [];
+    return best ? [{ index: record.index, geometry: best.geometry, properties: sanitizeDpfSourceProperties(best.properties) }] : [];
   });
+}
+
+function sanitizeDpfSourceProperties(properties) {
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return {};
+  const output = {};
+  let bytes = 0;
+  for (const [rawKey, rawValue] of Object.entries(properties).slice(0, 80)) {
+    if (rawValue !== null && !["string", "number", "boolean"].includes(typeof rawValue)) continue;
+    const key = String(rawKey).slice(0, 120);
+    if (!key) continue;
+    const value = typeof rawValue === "string" ? rawValue.slice(0, 500) : (typeof rawValue === "number" && !Number.isFinite(rawValue) ? null : rawValue);
+    const entryBytes = Buffer.byteLength(key, "utf8") + Buffer.byteLength(String(value ?? ""), "utf8");
+    if (bytes + entryBytes > 16 * 1024) break;
+    output[key] = value;
+    bytes += entryBytes;
+  }
+  return output;
 }
 
 function normalizeDpfMatchText(value) {
@@ -885,5 +902,6 @@ module.exports._test = Object.freeze({
   extractNlniZipUrl,
   extractGeoJsonFilesFromZip,
   readZipEntries,
-  matchDpfGeometryRecords
+  matchDpfGeometryRecords,
+  sanitizeDpfSourceProperties
 });
