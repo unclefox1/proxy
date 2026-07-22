@@ -319,7 +319,7 @@ function extractNlniZipUrl(html, sourceUrl, prefectureCode = "") {
 
 function extractGeoJsonFilesFromZip(buffer) {
   const { inflateRawSync } = require("node:zlib");
-  const entries = readZipEntries(buffer).filter((entry) => /\/UTF-8\/[^/]+\.geojson$/i.test(entry.name));
+  const entries = readZipEntries(buffer).filter((entry) => /(?:^|\/)[^/]+\.geojson$/i.test(entry.name));
   const files = [];
   let totalBytes = 0;
   for (const entry of entries.slice(0, 8)) {
@@ -338,7 +338,7 @@ function extractGeoJsonFilesFromZip(buffer) {
     if (output.length !== entry.uncompressedSize) throw new Error("ZIP entry size mismatch");
     files.push({ name: entry.name, text: output.toString("utf8") });
   }
-  if (!files.length) throw new Error("Official ZIP contains no UTF-8 GeoJSON files");
+  if (!files.length) throw new Error("Official ZIP contains no GeoJSON files");
   return files;
 }
 
