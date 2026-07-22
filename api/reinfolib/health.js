@@ -39,6 +39,7 @@ const DPF_GEOMETRY_MAX_HTML_BYTES = 2 * 1024 * 1024;
 const DPF_GEOMETRY_MAX_ZIP_BYTES = 40 * 1024 * 1024;
 const DPF_GEOMETRY_MAX_UNCOMPRESSED_BYTES = 120 * 1024 * 1024;
 const DPF_GEOMETRY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+const DPF_GEOMETRY_MAX_PREFECTURES = 8;
 const DPF_GEOMETRY_CACHE = new Map();
 
 module.exports = async function handler(req, res) {
@@ -151,12 +152,27 @@ async function handleDpfGeometryResolution(req, res) {
   try {
     const sourceUrl = validateDpfGeometrySourceUrl(req.body?.sourceUrl);
     const records = normalizeDpfGeometryRecords(req.body?.records);
-    const source = await loadDpfGeometrySource(sourceUrl);
-    const geometries = matchDpfGeometryRecords(records, source.features);
+    const recordsByPrefecture = new Map();
+    records.forEach((record) => {
+      const key = record.prefectureCode || "";
+      if (!recordsByPrefecture.has(key)) recordsByPrefecture.set(key, []);
+      recordsByPrefecture.get(key).push(record);
+    });
+    if (recordsByPrefecture.size > DPF_GEOMETRY_MAX_PREFECTURES) {
+      throw new DpfGeometryInputError("Too many prefectures in one geometry request");
+    }
+    const geometries = [];
+    const zipUrls = [];
+    for (const [prefectureCode, groupedRecords] of recordsByPrefecture) {
+      const source = await loadDpfGeometrySource(sourceUrl, prefectureCode);
+      zipUrls.push(source.zipUrl);
+      geometries.push(...matchDpfGeometryRecords(groupedRecords, source.features));
+    }
     const payload = {
       ok: true,
       sourceUrl,
-      zipUrl: source.zipUrl,
+      zipUrl: zipUrls[0] || "",
+      zipUrls: Array.from(new Set(zipUrls)),
       geometries,
       fetchedAt: new Date().toISOString()
     };
@@ -205,19 +221,34 @@ function normalizeDpfGeometryRecords(value) {
     const lon = Number(item?.lon);
     const lat = Number(item?.lat);
     const title = String(item?.title || "").trim().slice(0, 200);
+    const prefectureCode = normalizeDpfPrefectureCode(item?.prefectureCode);
+    const matchValues = Array.from(new Set([
+      title,
+      ...(Array.isArray(item?.matchValues) ? item.matchValues : [])
+    ].map((entry) => String(entry || "").trim().slice(0, 200)).filter(Boolean))).slice(0, 8);
     if (!Number.isInteger(index) || index < 0 || !Number.isFinite(lon) || !Number.isFinite(lat) || !title) {
       throw new DpfGeometryInputError("Invalid geometry record");
     }
     if (lon < -180 || lon > 180 || lat < -90 || lat > 90) throw new DpfGeometryInputError("Invalid geometry coordinate");
-    return { index, title, lon, lat };
+    return { index, title, lon, lat, prefectureCode, matchValues };
   });
 }
 
-async function loadDpfGeometrySource(sourceUrl) {
-  const cached = DPF_GEOMETRY_CACHE.get(sourceUrl);
+function normalizeDpfPrefectureCode(value) {
+  const digits = String(value ?? "").normalize("NFKC").replace(/\D/g, "");
+  if (!digits) return "";
+  const code = digits.length === 1 ? digits.padStart(2, "0") : digits.slice(0, 2);
+  const number = Number(code);
+  if (number < 1 || number > 47) throw new DpfGeometryInputError("Invalid prefecture code");
+  return code;
+}
+
+async function loadDpfGeometrySource(sourceUrl, prefectureCode = "") {
+  const cacheKey = `${sourceUrl}|${prefectureCode}`;
+  const cached = DPF_GEOMETRY_CACHE.get(cacheKey);
   if (cached) return cached;
   const html = await fetchDpfBuffer(sourceUrl, DPF_GEOMETRY_MAX_HTML_BYTES, "text/html");
-  const zipUrl = extractNlniZipUrl(html.toString("utf8"), sourceUrl);
+  const zipUrl = extractNlniZipUrl(html.toString("utf8"), sourceUrl, prefectureCode);
   const zip = await fetchDpfBuffer(zipUrl, DPF_GEOMETRY_MAX_ZIP_BYTES, "application/zip");
   const files = extractGeoJsonFilesFromZip(zip);
   const features = [];
@@ -241,8 +272,8 @@ async function loadDpfGeometrySource(sourceUrl) {
   });
   if (!features.length) throw new Error("Official ZIP contains no usable GeoJSON features");
   const source = { sourceUrl, zipUrl, features };
-  DPF_GEOMETRY_CACHE.set(sourceUrl, source);
-  while (DPF_GEOMETRY_CACHE.size > 2) DPF_GEOMETRY_CACHE.delete(DPF_GEOMETRY_CACHE.keys().next().value);
+  DPF_GEOMETRY_CACHE.set(cacheKey, source);
+  while (DPF_GEOMETRY_CACHE.size > 8) DPF_GEOMETRY_CACHE.delete(DPF_GEOMETRY_CACHE.keys().next().value);
   return source;
 }
 
@@ -266,10 +297,15 @@ async function fetchDpfBuffer(url, maxBytes, accept) {
   }
 }
 
-function extractNlniZipUrl(html, sourceUrl) {
+function extractNlniZipUrl(html, sourceUrl, prefectureCode = "") {
   const paths = Array.from(String(html || "").matchAll(/["'](\.\.\/data\/[A-Za-z0-9_./-]+\.zip)["']/gi), (match) => match[1]);
   if (!paths.length) throw new Error("Official ZIP URL was not found");
-  const zipUrl = new URL(paths[0], sourceUrl);
+  const normalizedPrefecture = normalizeDpfPrefectureCode(prefectureCode);
+  const selectedPath = normalizedPrefecture
+    ? paths.find((path) => new RegExp(`_${normalizedPrefecture}(?:_GML)?\\.zip$`, "i").test(path))
+    : paths[0];
+  if (!selectedPath) throw new Error(`Official ZIP for prefecture ${normalizedPrefecture} was not found`);
+  const zipUrl = new URL(selectedPath, sourceUrl);
   if (
     zipUrl.protocol !== "https:"
     || zipUrl.hostname !== "nlftp.mlit.go.jp"
@@ -347,7 +383,8 @@ function matchDpfGeometryRecords(records, features) {
     });
   });
   return records.flatMap((record) => {
-    const candidates = byTitle.get(normalizeDpfMatchText(record.title)) || [];
+    const candidates = Array.from(new Set((record.matchValues?.length ? record.matchValues : [record.title])
+      .flatMap((value) => byTitle.get(normalizeDpfMatchText(value)) || [])));
     let best = null;
     let bestDistance = Infinity;
     candidates.forEach((feature) => {
@@ -899,6 +936,7 @@ module.exports._test = Object.freeze({
   normalizeDpfResult,
   validateDpfGeometrySourceUrl,
   normalizeDpfGeometryRecords,
+  normalizeDpfPrefectureCode,
   extractNlniZipUrl,
   extractGeoJsonFilesFromZip,
   readZipEntries,
